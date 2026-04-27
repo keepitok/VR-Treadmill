@@ -1,6 +1,6 @@
 # Maratron TreadMouse
 
-Converts mouse movement into virtual joystick movement for use with the [Maratron](https://www.youtube.com/watch?v=EzYy1MZocXU) manual treadmill VR setup.
+Converts mouse movement into virtual joystick movement for use with the [Maratron](https://www.youtube.com/watch?v=EzYy1MZocXU) manual treadmill VR setup (instead of REWASD).
 
 Forked from [Fer Sler's project](https://github.com/fer-sler/VR-Treadmill), updated UI and added persistent settings.
 
