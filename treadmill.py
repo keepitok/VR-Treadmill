@@ -1,3 +1,5 @@
+import ctypes
+import ctypes.wintypes
 import time
 import threading
 import json
@@ -39,6 +41,146 @@ sensitivity = _cfg["sensitivity"]
 pollRate    = _cfg["pollRate"]
 invertY     = _cfg["invertY"]
 # -------------------------------------------------------------------
+
+# -------------------------------------------------------------------
+# Win32 Raw Mouse Input — reads hardware delta Y directly,
+# bypassing cursor position, screen edges, and Windows acceleration.
+# -------------------------------------------------------------------
+class _RawMouseReader:
+    _WM_INPUT        = 0x00FF
+    _WM_DESTROY      = 0x0002
+    _RIDEV_INPUTSINK = 0x00000100
+    _RID_INPUT       = 0x10000003
+
+    def __init__(self):
+        self._delta_y = 0
+        self._lock    = threading.Lock()
+        self._hwnd    = None
+        self._ready   = threading.Event()
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+        self._ready.wait(timeout=5)
+
+    def consume_delta(self):
+        """Return total accumulated Y delta since last call and reset it."""
+        with self._lock:
+            val = self._delta_y
+            self._delta_y = 0
+        return val
+
+    def _run(self):
+        user32   = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        user32.DefWindowProcW.restype  = ctypes.c_longlong
+        user32.DefWindowProcW.argtypes = [
+            ctypes.wintypes.HWND, ctypes.wintypes.UINT,
+            ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
+
+        WNDPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_longlong,
+            ctypes.wintypes.HWND, ctypes.wintypes.UINT,
+            ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+
+        def _wnd_proc(hwnd, msg, wparam, lparam):
+            if msg == self._WM_INPUT:
+                self._handle_raw(hwnd, lparam)
+                return 0
+            if msg == self._WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        self._cb = WNDPROC(_wnd_proc)  # keep reference alive
+
+        class WNDCLASSEX(ctypes.Structure):
+            _fields_ = [("cbSize",        ctypes.wintypes.UINT),
+                        ("style",         ctypes.wintypes.UINT),
+                        ("lpfnWndProc",   WNDPROC),
+                        ("cbClsExtra",    ctypes.c_int),
+                        ("cbWndExtra",    ctypes.c_int),
+                        ("hInstance",     ctypes.wintypes.HANDLE),
+                        ("hIcon",         ctypes.wintypes.HANDLE),
+                        ("hCursor",       ctypes.wintypes.HANDLE),
+                        ("hbrBackground", ctypes.wintypes.HANDLE),
+                        ("lpszMenuName",  ctypes.wintypes.LPCWSTR),
+                        ("lpszClassName", ctypes.wintypes.LPCWSTR),
+                        ("hIconSm",       ctypes.wintypes.HANDLE)]
+
+        hinstance = kernel32.GetModuleHandleW(None)
+        wc = WNDCLASSEX()
+        wc.cbSize        = ctypes.sizeof(WNDCLASSEX)
+        wc.lpfnWndProc   = self._cb
+        wc.hInstance     = hinstance
+        wc.lpszClassName = "TreadmillRawInput"
+        user32.RegisterClassExW(ctypes.byref(wc))
+
+        WS_POPUP = 0x80000000  # hidden window — no taskbar entry, no title bar
+        hwnd = user32.CreateWindowExW(
+            0, "TreadmillRawInput", "", WS_POPUP,
+            0, 0, 0, 0,
+            None, None, hinstance, None)
+        self._hwnd = hwnd
+
+        class RAWINPUTDEVICE(ctypes.Structure):
+            _fields_ = [("usUsagePage", ctypes.wintypes.USHORT),
+                        ("usUsage",     ctypes.wintypes.USHORT),
+                        ("dwFlags",     ctypes.wintypes.DWORD),
+                        ("hwndTarget",  ctypes.wintypes.HWND)]
+
+        rid = RAWINPUTDEVICE()
+        rid.usUsagePage = 0x01              # Generic Desktop Controls
+        rid.usUsage     = 0x02              # Mouse
+        rid.dwFlags     = self._RIDEV_INPUTSINK  # receive input even without focus
+        rid.hwndTarget  = hwnd
+        reg_ok = user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid))
+
+        self._ready.set()
+
+        msg = ctypes.wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _handle_raw(self, hwnd, lparam):
+        user32 = ctypes.windll.user32
+
+        class RAWINPUTHEADER(ctypes.Structure):
+            _fields_ = [("dwType",  ctypes.wintypes.DWORD),
+                        ("dwSize",  ctypes.wintypes.DWORD),
+                        ("hDevice", ctypes.wintypes.HANDLE),
+                        ("wParam",  ctypes.wintypes.WPARAM)]
+
+        class RAWMOUSE(ctypes.Structure):
+            _fields_ = [("usFlags",           ctypes.wintypes.USHORT),
+                        ("usButtonFlags",      ctypes.wintypes.USHORT),
+                        ("usButtonData",       ctypes.wintypes.USHORT),
+                        ("ulRawButtons",       ctypes.wintypes.ULONG),
+                        ("lLastX",             ctypes.c_long),
+                        ("lLastY",             ctypes.c_long),
+                        ("ulExtraInformation", ctypes.wintypes.ULONG)]
+
+        class RAWINPUT(ctypes.Structure):
+            _fields_ = [("header", RAWINPUTHEADER),
+                        ("mouse",  RAWMOUSE)]
+
+        size = ctypes.wintypes.UINT(ctypes.sizeof(RAWINPUT))
+        ri   = RAWINPUT()
+        res  = user32.GetRawInputData(
+            ctypes.wintypes.HANDLE(lparam),
+            self._RID_INPUT,
+            ctypes.byref(ri),
+            ctypes.byref(size),
+            ctypes.sizeof(RAWINPUTHEADER))
+
+        if res == ctypes.wintypes.UINT(-1).value:
+            return  # error reading data
+        if ri.header.dwType == 0:                   # RIM_TYPEMOUSE
+            if (ri.mouse.usFlags & 0x0001) == 0:    # MOUSE_MOVE_RELATIVE
+                with self._lock:
+                    self._delta_y += ri.mouse.lLastY
+
+_raw_reader = _RawMouseReader()
 
 class MainWindow(QWidget):
 
@@ -321,32 +463,30 @@ class MainWindow(QWidget):
         self.startJoy.style().polish(self.startJoy)
 
     def _pollLoop(self):
-        mousey = 0
+        mousey  = 0
         mousey1 = 0
         mousey2 = 0
+        _raw_reader.consume_delta()  # flush any pre-accumulated movement
         while not stop_event.is_set():
             mousey2 = mousey1
-            mousey1 = 0
-            
+
+            raw_delta = _raw_reader.consume_delta()  # hardware Y counts since last poll
             direction = sensitivity if invertY else -(sensitivity)
-            mousey1 = (mouse.position[1] - 500) * direction # convert mouse position to joystick value
-            
-            mousey = max(-32768, min(32767, int((mousey1 + mousey2)/2))) # average and clamp
-            mouse.position = (700, 500) # reset mouse position, CHANGE THIS IF THE MOUSE IS OFF SCREEN
+            mousey1 = raw_delta * direction
+
+            mousey = max(-32768, min(32767, int((mousey1 + mousey2) / 2)))  # average and clamp
             if mousey != 0:
                 print("Joystick y:", mousey)
-            
-            gamepad.left_joystick(x_value=0, y_value=mousey)  # values between -32768 and 32767
-            
+
+            gamepad.left_joystick(x_value=0, y_value=mousey)
             gamepad.update()
-            
             time.sleep(1 / pollRate)
 
-        # release joystick and restore mouse when stopped
+        # release joystick when stopped
         gamepad.left_joystick(x_value=0, y_value=0)
         gamepad.update()
         self._loopStopped.emit()
-        print("Loop stopped, mouse restored")
+        print("Loop stopped")
         
 def onPress(key):
     global ctrlPressed

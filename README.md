@@ -35,11 +35,12 @@ Once SteamVR loads, the virtual gamepad should appear as a connected/active cont
 **4. Configure controller bindings in SteamVR**  
 Go to **Settings → Controllers → Manage Controller Bindings**, select **Gamepad**, and edit the binding for your game. Map the **left joystick** to locomotion/movement.
 
-**5. Start your game**
+**5. Begin treadmill tracking**  
+Click **▶ Start** in the Maratron TreadMouse window (or use the hotkey **Ctrl + `**). 
 
-**6. Begin treadmill tracking**  
-Switch to the Maratron TreadMouse window and click **▶ Start** (or use the hotkey **Ctrl + `**). Switch back to your game and walk.  
-To pause tracking, switch back to Maratron TreadMouse and click **⏹ Stop**.
+**6. Start your game**
+
+
 
 ---
 
