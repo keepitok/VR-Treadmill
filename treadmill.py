@@ -4,18 +4,24 @@ import time
 import threading
 import json
 import os
+import sys
 from pynput.keyboard import Key, Listener
 from pynput.mouse import Controller
+from pythonosc import dispatcher, osc_server
 from PyQt6 import QtCore
-from PyQt6.QtWidgets import QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QLineEdit, QLabel
-from PyQt6.QtGui import QFont
+from PyQt6.QtWidgets import QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QLineEdit, QLabel, QFrame, QCheckBox
+from PyQt6.QtGui import QFont, QPainter, QColor, QPen, QBrush
 import vgamepad as vg
+
+DEBUG = "--debug" in sys.argv
 
 # -------------------------------------------------------------------
 # Config persistence
 # -------------------------------------------------------------------
 _CONFIG_PATH = os.path.join(os.environ["APPDATA"], "Maratron TreadMouse", "config.json")
-_DEFAULTS = {"sensitivity": 35, "pollRate": 30, "invertY": False}
+_DEFAULTS = {"sensitivity": 35, "pollRate": 30, "invertY": False,
+             "snapThreshold": 120, "snapDuration": 150, "vmcPort": 39539,
+             "mouseEnabled": True, "hipEnabled": False}
 
 def _load_config():
     try:
@@ -27,9 +33,12 @@ def _load_config():
 def _save_config():
     os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
     with open(_CONFIG_PATH, "w") as f:
-        json.dump({"sensitivity": sensitivity, "pollRate": pollRate, "invertY": invertY}, f, indent=2)
+        json.dump({"sensitivity": sensitivity, "pollRate": pollRate, "invertY": invertY,
+                   "snapThreshold": snapThreshold, "snapDuration": snapDuration, "vmcPort": vmcPort,
+                   "mouseEnabled": mouseEnabled, "hipEnabled": hipEnabled}, f, indent=2)
 
 gamepad = vg.VX360Gamepad()
+gamepad_lock = threading.Lock()
 mouse = Controller()
 stop_event = threading.Event()
 ctrlPressed = False
@@ -37,9 +46,14 @@ window = None
 
 # -------------------------------------------------------------------
 _cfg = _load_config()
-sensitivity = _cfg["sensitivity"]
-pollRate    = _cfg["pollRate"]
-invertY     = _cfg["invertY"]
+sensitivity   = _cfg["sensitivity"]
+pollRate      = _cfg["pollRate"]
+invertY       = _cfg["invertY"]
+snapThreshold = _cfg["snapThreshold"]
+snapDuration  = _cfg["snapDuration"]
+vmcPort       = _cfg["vmcPort"]
+mouseEnabled  = _cfg["mouseEnabled"]
+hipEnabled    = _cfg["hipEnabled"]
 # -------------------------------------------------------------------
 
 # -------------------------------------------------------------------
@@ -182,10 +196,195 @@ class _RawMouseReader:
 
 _raw_reader = _RawMouseReader()
 
+# -------------------------------------------------------------------
+# Hip Snap-Turn — listens for SlimeVR VMC/OSC output, detects fast
+# hip yaw twists, and fires brief right-joystick pulses on the gamepad.
+# -------------------------------------------------------------------
+import math as _math
+
+class _ReusableOSCServer(osc_server.ThreadingOSCUDPServer):
+    allow_reuse_address = True
+
+class HipSnapTurner:
+    _COOLDOWN      = 0.6   # seconds between snaps
+    _STATUS_EVERY  = 5.0   # seconds between periodic yaw prints
+    _STALL_AFTER   = 5.0   # seconds without data before warning
+
+    def __init__(self):
+        self._running        = False
+        self._server         = None
+        self._last_snap      = 0.0
+        self._prev_yaw       = None
+        self._prev_time      = None
+        self._connected      = False
+        self._last_packet    = 0.0
+        self._last_status    = 0.0
+        self._stall_warned   = False
+
+    def start(self):
+        if self._running:
+            return
+        disp = dispatcher.Dispatcher()
+        disp.map("/VMC/Ext/Bone/Pos", self._on_bone)
+        self._server       = _ReusableOSCServer(("0.0.0.0", vmcPort), disp)
+        self._running      = True
+        self._connected    = False
+        self._stall_warned = False
+        self._prev_yaw     = None
+        self._prev_time    = None
+        t = threading.Thread(target=self._server.serve_forever, daemon=True)
+        t.start()
+        threading.Thread(target=self._watchdog, daemon=True).start()
+        print(f"[Hip] Listening on UDP {vmcPort}...")
+
+    def stop(self):
+        if not self._running:
+            return
+        self._server.shutdown()
+        self._server    = None
+        self._running   = False
+        self._connected = False
+        self._prev_yaw  = None
+        self._prev_time = None
+        print("[Hip] Stopped")
+
+    def _watchdog(self):
+        """Prints a stall warning if data stops arriving after first connection."""
+        while self._running:
+            time.sleep(1.0)
+            if self._connected and self._running:
+                gap = time.monotonic() - self._last_packet
+                if gap > self._STALL_AFTER and not self._stall_warned:
+                    print(f"[Hip] No data for {self._STALL_AFTER:.0f}s — "
+                          f"is SlimeVR VMC output enabled on port {vmcPort}?")
+                    self._stall_warned = True
+                elif gap <= self._STALL_AFTER:
+                    self._stall_warned = False
+
+    def _on_bone(self, address, *args):
+        # VMC /VMC/Ext/Bone/Pos: bone_name, px, py, pz, qx, qy, qz, qw
+        if len(args) < 8 or args[0] != "Hips":
+            return
+        now = time.monotonic()
+        self._last_packet = now
+
+        if not self._connected:
+            self._connected = True
+            print("[Hip] Connected — receiving data from SlimeVR")
+
+        qx, qy, qz, qw = args[4], args[5], args[6], args[7]
+        yaw = _math.degrees(_math.atan2(2.0 * (qw * qy + qx * qz),
+                                        1.0 - 2.0 * (qy * qy + qz * qz)))
+
+        rate = 0.0
+        if self._prev_yaw is not None and self._prev_time is not None:
+            dt = now - self._prev_time
+            if dt > 0:
+                delta = (yaw - self._prev_yaw + 180.0) % 360.0 - 180.0
+                rate  = delta / dt  # °/s
+                if (abs(rate) > snapThreshold
+                        and (now - self._last_snap) > self._COOLDOWN):
+                    self._do_snap(1 if rate > 0 else -1)
+
+        # Throttled status print
+        if DEBUG and now - self._last_status >= self._STATUS_EVERY:
+            self._last_status = now
+            print(f"[Hip] yaw: {yaw:+.1f}°  rate: {rate:.0f} °/s")
+
+        self._prev_yaw  = yaw
+        self._prev_time = now
+
+    def _do_snap(self, sign):
+        self._last_snap = time.monotonic()
+        axis = 32767 if sign > 0 else -32768
+        duration = snapDuration / 1000.0
+        print(f"[Hip] snap {'right' if axis > 0 else 'left'}")
+
+        def _pulse():
+            with gamepad_lock:
+                gamepad.right_joystick(x_value=axis, y_value=0)
+                gamepad.update()
+            time.sleep(duration)
+            with gamepad_lock:
+                gamepad.right_joystick(x_value=0, y_value=0)
+                gamepad.update()
+
+        threading.Thread(target=_pulse, daemon=True).start()
+
+hip_turner = HipSnapTurner()
+
+
+class ToggleSwitch(QCheckBox):
+    """Pill-style toggle with sliding knob; label text reflects state."""
+    _W, _H = 56, 30
+
+    def __init__(self, name, on_suffix="  enabled", off_suffix="  disabled", parent=None):
+        super().__init__(parent)
+        self._name      = name
+        self._on_text   = name + on_suffix
+        self._off_text  = name + off_suffix
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.stateChanged.connect(lambda _: self.update())
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        longer = max(self._on_text, self._off_text, key=len)
+        tw = fm.horizontalAdvance(longer)
+        h  = max(self._H + 10, fm.height() + 12)
+        return QtCore.QSize(self._W + 16 + tw, h)
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self._W, self._H
+        ty   = (self.height() - h) // 2
+        r    = h / 2
+        if not self.isEnabled():
+            track_fill   = QColor("#1a1a30")
+            track_border = QColor("#2a2a48")
+            knob_col     = QColor("#2e2e4e")
+            knob_x       = 4.0 if not self.isChecked() else float(w - h + 4)
+            text_col     = QColor("#35355a")
+            label        = self._on_text if self.isChecked() else self._off_text
+        elif self.isChecked():
+            track_fill   = QColor("#1a5c33")
+            track_border = QColor("#2ecc71")
+            knob_col     = QColor("#ffffff")
+            knob_x       = float(w - h + 4)
+            text_col     = QColor("#e0e0e0")
+            label        = self._on_text
+        else:
+            track_fill   = QColor("#252545")
+            track_border = QColor("#4a4a7a")
+            knob_col     = QColor("#6a6a8a")
+            knob_x       = 4.0
+            text_col     = QColor("#6a6a8a")
+            label        = self._off_text
+        p.setBrush(QBrush(track_fill))
+        p.setPen(QPen(track_border, 2))
+        p.drawRoundedRect(QtCore.QRectF(1, ty, w, h), r, r)
+        ks = h - 8
+        p.setBrush(QBrush(knob_col))
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.drawEllipse(QtCore.QRectF(knob_x, ty + 4, ks, ks))
+        p.setPen(text_col)
+        p.setFont(self.font())
+        p.drawText(QtCore.QRect(w + 16, 0, self.width() - w - 16, self.height()),
+                   QtCore.Qt.AlignmentFlag.AlignVCenter, label)
+        p.end()
+
+
 class MainWindow(QWidget):
 
     _loopStopped = QtCore.pyqtSignal()
     _hotkeyPressed = QtCore.pyqtSignal()
+    _START_LABEL = "▶ Start tracking"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -252,10 +451,27 @@ class MainWindow(QWidget):
                 background-color: #962222;
                 border-color: #f1948a;
             }
-            QPushButton#invertBtn[checked=true] {
+            QCheckBox {
+                color: #c8d0f0;
+                spacing: 14px;
+                padding: 6px 2px;
+            }
+            QCheckBox:hover {
+                color: #ffffff;
+            }
+            QCheckBox::indicator {
+                width: 52px;
+                height: 28px;
+                border-radius: 14px;
+                background-color: #252545;
+                border: 2px solid #4a4a7a;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #7070c0;
+            }
+            QCheckBox::indicator:checked {
                 background-color: #1a4a6b;
                 border-color: #3498db;
-                color: #aedcf8;
             }
             QLineEdit {
                 background-color: #12122a;
@@ -269,47 +485,81 @@ class MainWindow(QWidget):
                 border-color: #6060c0;
                 background-color: #16163a;
             }
+            QLineEdit:disabled {
+                background-color: #0e0e20;
+                color: #3a3a58;
+                border-color: #1e1e3a;
+            }
+            QPushButton:disabled {
+                background-color: #1c1c36;
+                color: #3a3a58;
+                border-color: #1e1e3a;
+            }
+            QLabel:disabled {
+                color: #3a3a58;
+            }
+            QCheckBox:disabled {
+                color: #3a3a58;
+            }
+            QCheckBox::indicator:disabled {
+                background-color: #1c1c36;
+                border-color: #1e1e3a;
+            }
         """)
 
         # --- Widgets ---
-        self.startJoy = QPushButton("▶  Start")
+        self.startJoy = QPushButton(self._START_LABEL)
         self.startJoy.setObjectName("startBtn")
         self.startJoy.setFont(startFont)
         self.startJoy.setMinimumHeight(90)
         self.startJoy.setProperty("running", False)
-        self.startJoy.clicked.connect(self.toggleRun)
+        self.startJoy.clicked.connect(self.toggleAll)
         self._running = False
         self._loopStopped.connect(self._onLoopStopped)
-        self._hotkeyPressed.connect(self.toggleRun)
+        self._hotkeyPressed.connect(self.toggleAll)
 
         self.keyLabel = QLabel("Hotkey: Ctrl + `")
         self.keyLabel.setObjectName("hotkeyLabel")
         self.keyLabel.setFont(hotkeyFont)
         self.keyLabel.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
 
+        toggleFont = QFont("Segoe UI", 16)
+        toggleFont.setWeight(QFont.Weight.Bold)
+
+        # --- Left column: Mouse ---
+        self.mouseCheck = ToggleSwitch("Mouse tracking")
+        self.mouseCheck.setFont(toggleFont)
+        self.mouseCheck.setChecked(mouseEnabled)
+        self.mouseCheck.stateChanged.connect(self.onMouseCheckChanged)
+
+        self.invertCheck = ToggleSwitch("Invert Y", "  on", "  off")
+        self.invertCheck.setFont(labelFont)
+        self.invertCheck.setChecked(invertY)
+        self.invertCheck.stateChanged.connect(self.onInvertYChanged)
+
         senseLabel = QLabel("SENSITIVITY")
         senseLabel.setFont(labelFont)
 
         self.senseLine = QLineEdit(str(sensitivity))
         self.senseLine.setFont(inputFont)
-        self.senseLine.setMinimumHeight(64)
+        self.senseLine.setMinimumHeight(56)
         self.senseLine.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.senseLine.textChanged.connect(self.setSensitivity)
 
         senseDecBtn = QPushButton("−")
         senseDecBtn.setFont(btnFont)
-        senseDecBtn.setMinimumHeight(64)
-        senseDecBtn.setMinimumWidth(80)
+        senseDecBtn.setMinimumHeight(56)
+        senseDecBtn.setMinimumWidth(60)
         senseDecBtn.clicked.connect(self.decreaseSensitivity)
 
         senseIncBtn = QPushButton("+")
         senseIncBtn.setFont(btnFont)
-        senseIncBtn.setMinimumHeight(64)
-        senseIncBtn.setMinimumWidth(80)
+        senseIncBtn.setMinimumHeight(56)
+        senseIncBtn.setMinimumWidth(60)
         senseIncBtn.clicked.connect(self.increaseSensitivity)
 
         senseRow = QHBoxLayout()
-        senseRow.setSpacing(10)
+        senseRow.setSpacing(8)
         senseRow.addWidget(senseDecBtn)
         senseRow.addWidget(self.senseLine)
         senseRow.addWidget(senseIncBtn)
@@ -319,51 +569,129 @@ class MainWindow(QWidget):
 
         self.pollRateLine = QLineEdit(str(pollRate))
         self.pollRateLine.setFont(inputFont)
-        self.pollRateLine.setMinimumHeight(64)
+        self.pollRateLine.setMinimumHeight(56)
         self.pollRateLine.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.pollRateLine.textChanged.connect(self.setPollingRate)
 
         pollDecBtn = QPushButton("−")
         pollDecBtn.setFont(btnFont)
-        pollDecBtn.setMinimumHeight(64)
-        pollDecBtn.setMinimumWidth(80)
+        pollDecBtn.setMinimumHeight(56)
+        pollDecBtn.setMinimumWidth(60)
         pollDecBtn.clicked.connect(self.decreasePollRate)
+
         pollIncBtn = QPushButton("+")
         pollIncBtn.setFont(btnFont)
-        pollIncBtn.setMinimumHeight(64)
-        pollIncBtn.setMinimumWidth(80)
+        pollIncBtn.setMinimumHeight(56)
+        pollIncBtn.setMinimumWidth(60)
         pollIncBtn.clicked.connect(self.increasePollRate)
 
         pollRow = QHBoxLayout()
-        pollRow.setSpacing(10)
+        pollRow.setSpacing(8)
         pollRow.addWidget(pollDecBtn)
         pollRow.addWidget(self.pollRateLine)
         pollRow.addWidget(pollIncBtn)
 
-        self.invertBtn = QPushButton("Invert Y: ON" if invertY else "Invert Y: OFF")
-        self.invertBtn.setObjectName("invertBtn")
-        self.invertBtn.setFont(btnFont)
-        self.invertBtn.setMinimumHeight(70)
-        self.invertBtn.setCheckable(True)
-        self.invertBtn.setChecked(invertY)
-        self.invertBtn.setProperty("checked", invertY)
-        self.invertBtn.clicked.connect(self.toggleInvertY)
+        self.mouseSubGroup = QFrame()
+        mouseSubLayout = QVBoxLayout(self.mouseSubGroup)
+        mouseSubLayout.setContentsMargins(0, 4, 0, 0)
+        mouseSubLayout.setSpacing(10)
+        mouseSubLayout.addWidget(self.invertCheck)
+        mouseSubLayout.addSpacing(4)
+        mouseSubLayout.addWidget(senseLabel)
+        mouseSubLayout.addLayout(senseRow)
+        mouseSubLayout.addSpacing(4)
+        mouseSubLayout.addWidget(pollLabel)
+        mouseSubLayout.addLayout(pollRow)
+        self.mouseSubGroup.setEnabled(mouseEnabled)
 
-        # --- Layout ---
+        leftCol = QVBoxLayout()
+        leftCol.setSpacing(10)
+        leftCol.addWidget(self.mouseCheck)
+        leftCol.addWidget(self.mouseSubGroup)
+        leftCol.addStretch()
+
+        # --- Separator ---
+        separator = QFrame()
+        separator.setFixedWidth(2)
+        separator.setStyleSheet("background-color: #3a3a6a;")
+
+        # --- Right column: Hip ---
+        self.hipCheck = ToggleSwitch("Hip turns tracking")
+        self.hipCheck.setFont(toggleFont)
+        self.hipCheck.setChecked(hipEnabled)
+        self.hipCheck.stateChanged.connect(self.onHipCheckChanged)
+
+        snapLabel = QLabel("SNAP THRESHOLD  (°/s)")
+        snapLabel.setFont(labelFont)
+
+        self.snapLine = QLineEdit(str(snapThreshold))
+        self.snapLine.setFont(inputFont)
+        self.snapLine.setMinimumHeight(56)
+        self.snapLine.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.snapLine.textChanged.connect(self.setSnapThreshold)
+
+        snapDecBtn = QPushButton("−")
+        snapDecBtn.setFont(btnFont)
+        snapDecBtn.setMinimumHeight(56)
+        snapDecBtn.setMinimumWidth(60)
+        snapDecBtn.clicked.connect(self.decreaseSnapThreshold)
+
+        snapIncBtn = QPushButton("+")
+        snapIncBtn.setFont(btnFont)
+        snapIncBtn.setMinimumHeight(56)
+        snapIncBtn.setMinimumWidth(60)
+        snapIncBtn.clicked.connect(self.increaseSnapThreshold)
+
+        snapRow = QHBoxLayout()
+        snapRow.setSpacing(8)
+        snapRow.addWidget(snapDecBtn)
+        snapRow.addWidget(self.snapLine)
+        snapRow.addWidget(snapIncBtn)
+
+        vmcPortLabel = QLabel("VMC PORT OUT")
+        vmcPortLabel.setFont(labelFont)
+
+        self.vmcPortLine = QLineEdit(str(vmcPort))
+        self.vmcPortLine.setFont(inputFont)
+        self.vmcPortLine.setMinimumHeight(56)
+        self.vmcPortLine.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.vmcPortLine.textChanged.connect(self.setVmcPort)
+
+        self.hipSubGroup = QFrame()
+        hipSubLayout = QVBoxLayout(self.hipSubGroup)
+        hipSubLayout.setContentsMargins(0, 4, 0, 0)
+        hipSubLayout.setSpacing(10)
+        hipSubLayout.addWidget(snapLabel)
+        hipSubLayout.addLayout(snapRow)
+        hipSubLayout.addSpacing(4)
+        hipSubLayout.addWidget(vmcPortLabel)
+        hipSubLayout.addWidget(self.vmcPortLine)
+        self.hipSubGroup.setEnabled(hipEnabled)
+
+        rightCol = QVBoxLayout()
+        rightCol.setSpacing(10)
+        rightCol.addWidget(self.hipCheck)
+        rightCol.addWidget(self.hipSubGroup)
+        rightCol.addStretch()
+
+        # --- Two-column row ---
+        colsRow = QHBoxLayout()
+        colsRow.setSpacing(0)
+        colsRow.addLayout(leftCol, stretch=1)
+        colsRow.addSpacing(16)
+        colsRow.addWidget(separator)
+        colsRow.addSpacing(16)
+        colsRow.addLayout(rightCol, stretch=1)
+
+        # --- Main layout ---
         layout = QVBoxLayout()
         layout.setContentsMargins(28, 28, 28, 28)
         layout.setSpacing(14)
 
         layout.addWidget(self.startJoy)
         layout.addWidget(self.keyLabel)
-        layout.addSpacing(8)
-        layout.addWidget(self.invertBtn)
-        layout.addSpacing(8)
-        layout.addWidget(senseLabel)
-        layout.addLayout(senseRow)
-        layout.addSpacing(8)
-        layout.addWidget(pollLabel)
-        layout.addLayout(pollRow)
+        layout.addSpacing(12)
+        layout.addLayout(colsRow)
 
         self.setLayout(layout)
         self.show()
@@ -410,17 +738,55 @@ class MainWindow(QWidget):
         _save_config()
         print("Sensitivity:", sensitivity)
 
-    def toggleInvertY(self):
+    def onMouseCheckChanged(self, state):
+        global mouseEnabled
+        mouseEnabled = bool(state)
+        self.mouseSubGroup.setEnabled(mouseEnabled)
+        _save_config()
+
+    def onInvertYChanged(self, state):
         global invertY
-        invertY = not invertY
-        self.invertBtn.setText("Invert Y: ON" if invertY else "Invert Y: OFF")
-        self.invertBtn.setProperty("checked", invertY)
-        self.invertBtn.style().unpolish(self.invertBtn)
-        self.invertBtn.style().polish(self.invertBtn)
+        invertY = bool(state)
         _save_config()
         print("Invert Y:", invertY)
 
+    def onHipCheckChanged(self, state):
+        global hipEnabled
+        hipEnabled = bool(state)
+        self.hipSubGroup.setEnabled(hipEnabled)
+        _save_config()
+
+    def setSnapThreshold(a, b):
+        global snapThreshold
+        if b != "":
+            snapThreshold = int(b)
+            _save_config()
+            print("Snap threshold:", b)
+
+    def decreaseSnapThreshold(self):
+        global snapThreshold
+        snapThreshold = max(10, snapThreshold - 10)
+        self.snapLine.setText(str(snapThreshold))
+        _save_config()
+        print("Snap threshold:", snapThreshold)
+
+    def increaseSnapThreshold(self):
+        global snapThreshold
+        snapThreshold += 10
+        self.snapLine.setText(str(snapThreshold))
+        _save_config()
+        print("Snap threshold:", snapThreshold)
+
+    def setVmcPort(a, b):
+        global vmcPort
+        if b != "" and b.isdigit():
+            vmcPort = int(b)
+            _save_config()
+            print("VMC port:", vmcPort)
+
     def closeEvent(self, event):
+        if hip_turner._running:
+            hip_turner.stop()
         _save_config()
         event.accept()
             
@@ -439,28 +805,34 @@ class MainWindow(QWidget):
     #         keyToggle = False
         
         
-    def _onLoopStopped(self):
-        self._running = False
-        self.startJoy.setText("▶  Start")
-        self.startJoy.setProperty("running", False)
+    def toggleAll(self):
+        any_running = self._running or hip_turner._running
+        if any_running:
+            if self._running:
+                stop_event.set()
+                self._running = False
+            if hip_turner._running:
+                hip_turner.stop()
+            self._updateStartAllBtn()
+        else:
+            if self.mouseCheck.isChecked():
+                stop_event.clear()
+                self._running = True
+                threading.Thread(target=self._pollLoop, daemon=True).start()
+            if self.hipCheck.isChecked():
+                hip_turner.start()
+            self._updateStartAllBtn()
+
+    def _updateStartAllBtn(self):
+        any_running = self._running or hip_turner._running
+        self.startJoy.setText("Stop" if any_running else self._START_LABEL)
+        self.startJoy.setProperty("running", any_running)
         self.startJoy.style().unpolish(self.startJoy)
         self.startJoy.style().polish(self.startJoy)
 
-    def toggleRun(self):
-        if self._running:
-            stop_event.set()
-            self._running = False
-            self.startJoy.setText("▶  Start")
-            self.startJoy.setProperty("running", False)
-        else:
-            stop_event.clear()
-            self._running = True
-            self.startJoy.setText("⏹  Stop")
-            self.startJoy.setProperty("running", True)
-            t = threading.Thread(target=self._pollLoop, daemon=True)
-            t.start()
-        self.startJoy.style().unpolish(self.startJoy)
-        self.startJoy.style().polish(self.startJoy)
+    def _onLoopStopped(self):
+        self._running = False
+        self._updateStartAllBtn()
 
     def _pollLoop(self):
         mousey  = 0
@@ -478,13 +850,15 @@ class MainWindow(QWidget):
             if mousey != 0:
                 print("Joystick y:", mousey)
 
-            gamepad.left_joystick(x_value=0, y_value=mousey)
-            gamepad.update()
+            with gamepad_lock:
+                gamepad.left_joystick(x_value=0, y_value=mousey)
+                gamepad.update()
             time.sleep(1 / pollRate)
 
         # release joystick when stopped
-        gamepad.left_joystick(x_value=0, y_value=0)
-        gamepad.update()
+        with gamepad_lock:
+            gamepad.left_joystick(x_value=0, y_value=0)
+            gamepad.update()
         self._loopStopped.emit()
         print("Loop stopped")
         

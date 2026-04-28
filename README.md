@@ -1,6 +1,11 @@
 # Maratron TreadMouse
 
-Converts mouse movement into virtual joystick movement for use with the [Maratron](https://www.youtube.com/watch?v=EzYy1MZocXU) manual treadmill VR setup (instead of REWASD).
+Allows you to use mouse movement for forward/backward locomotion in VR — no gamepad required.
+
+**Mouse → Virtual Gamepad's left joystick → SteamVR binding → in-game locomotion**  
+**Phone on hip → owoTrack → SlimeVR → Virtual Gamepad's right joystick → SteamVR snap turn**
+
+Designed for use with the [Maratron](https://www.youtube.com/watch?v=EzYy1MZocXU) manual treadmill VR setup (instead of REWASD).
 
 Forked from [Fer Sler's project](https://github.com/fer-sler/VR-Treadmill), updated UI and added persistent settings.
 
@@ -8,15 +13,19 @@ Forked from [Fer Sler's project](https://github.com/fer-sler/VR-Treadmill), upda
 
 ## Requirements
 
-Python 3 and the following packages:
+* Windows, SteamVR
+* Ideally a gaming mouse with high DPI, mounted on/under the treadmill's belt
+* Python 3 and the following packages:
 
 ```
-pip install pynput vgamepad PyQt6
+pip install pynput vgamepad PyQt6 python-osc
 ```
+
+`vgamepad` will prompt you to install [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) if needed — a Windows driver that creates virtual Xbox/DS4 controllers the OS treats as real hardware.
 
 ---
 
-## Setup & Usage
+## Usage
 
 In my tests I followed these steps **in order** each session:
 
@@ -33,13 +42,26 @@ This registers a virtual Xbox 360 gamepad over USB. The Maratron TreadMouse wind
 Once SteamVR loads, the virtual gamepad should appear as a connected/active controller in the SteamVR device icons.
 
 **4. Configure controller bindings in SteamVR**  
-Go to **Settings → Controllers → Manage Controller Bindings**, select **Gamepad**, and edit the binding for your game. Map the **left joystick** to locomotion/movement.
+Go to **Settings → Controllers → Manage Controller Bindings**, select **Gamepad**, and edit the binding for your game. Map the **left joystick** to locomotion/movement and the **right joystick** to snap turn.
 
 **5. Begin treadmill tracking**  
-Click **▶ Start** in the Maratron TreadMouse window (or use the hotkey **Ctrl + `**). 
+Click **▶ Start** in the Maratron TreadMouse window. 
 
 **6. Start your game**
 
+---
+
+## Hip Snap Turns (optional)
+
+Mount an Android phone on your hip, install [owoTrack](https://play.google.com/store/apps/details?id=org.owoTrack.app), and run [SlimeVR Server](https://github.com/SlimeVR/SlimeVR-Server/releases). The phone acts as a hip IMU tracker.
+
+Additional setup steps (do these once):
+
+1. In SlimeVR Server, assign the phone tracker to the **Hip** slot.
+2. Go to **SlimeVR Settings → OSC/VMC**, enable **VMC output**, and set **Port Out** to **39539**.
+3. In the Maratron TreadMouse window, click **Hip Tracking: OFF** to toggle it on. The script will start listening for VMC data on UDP port 39540.
+
+A fast clockwise hip twist fires a **snap turn right**; anti-clockwise fires **snap turn left**. Adjust **Snap Threshold** to taste — lower values are more sensitive.
 
 
 ---
@@ -48,11 +70,13 @@ Click **▶ Start** in the Maratron TreadMouse window (or use the hotkey **Ctrl 
 
 | Control | Description |
 |---|---|
-| **▶ Start / ⏹ Stop** | Toggle mouse-to-joystick tracking |
-| **Ctrl + `** | Global hotkey to toggle tracking from anywhere |
-| **Sensitivity** | How strongly mouse movement maps to joystick. Use − / + to adjust by 10. |
-| **Polling Rate** | How many times per second the mouse position is read. Use − / + to adjust by 5. |
-| **Invert Y** | Flip the up/down joystick direction |
+| **▶ Start / ⏹ Stop** | Toggle tracking |
+| **Ctrl + `** | Hotkey to toggle tracking |
+| **Sensitivity** | Controls in-game walking speed |
+| **Polling Rate** | Mouse reads per second — higher is smoother |
+| **Invert Y** | Flip forward/backward direction |
+| **Hip Tracking** | Toggle hip snap-turn tracking (requires SlimeVR + owoTrack) |
+| **Snap Threshold** | Minimum yaw rate (°/s) to trigger a snap turn |
 
-Settings (sensitivity, polling rate, invert Y) are saved automatically and restored on next launch.
+Settings are saved automatically.
 
