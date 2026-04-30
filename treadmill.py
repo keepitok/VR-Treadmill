@@ -20,7 +20,7 @@ DEBUG = "--debug" in sys.argv
 # -------------------------------------------------------------------
 _CONFIG_PATH = os.path.join(os.environ["APPDATA"], "Maratron TreadMouse", "config.json")
 _DEFAULTS = {"sensitivity": 35, "pollRate": 30, "invertY": False,
-             "snapThreshold": 120, "snapDuration": 600, "vmcPort": 39539,
+             "snapThreshold": 120, "snapDuration": 400, "snapReturnDelay": 1000, "vmcPort": 39539,
              "mouseEnabled": True, "hipEnabled": False, "snapUseKeyboard": False}
 
 def _load_config():
@@ -34,7 +34,8 @@ def _save_config():
     os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
     with open(_CONFIG_PATH, "w") as f:
         json.dump({"sensitivity": sensitivity, "pollRate": pollRate, "invertY": invertY,
-                   "snapThreshold": snapThreshold, "snapDuration": snapDuration, "vmcPort": vmcPort,
+                   "snapThreshold": snapThreshold, "snapDuration": snapDuration,
+                   "snapReturnDelay": snapReturnDelay, "vmcPort": vmcPort,
                    "mouseEnabled": mouseEnabled, "hipEnabled": hipEnabled,
                    "snapUseKeyboard": snapUseKeyboard}, f, indent=2)
 
@@ -50,9 +51,10 @@ _cfg = _load_config()
 sensitivity   = _cfg["sensitivity"]
 pollRate      = _cfg["pollRate"]
 invertY       = _cfg["invertY"]
-snapThreshold = _cfg["snapThreshold"]
-snapDuration  = _cfg["snapDuration"]
-vmcPort       = _cfg["vmcPort"]
+snapThreshold   = _cfg["snapThreshold"]
+snapDuration    = _cfg["snapDuration"]
+snapReturnDelay = _cfg["snapReturnDelay"]
+vmcPort         = _cfg["vmcPort"]
 mouseEnabled     = _cfg["mouseEnabled"]
 hipEnabled       = _cfg["hipEnabled"]
 snapUseKeyboard  = _cfg["snapUseKeyboard"]
@@ -218,6 +220,7 @@ class HipSnapTurner:
         self._running        = False
         self._server         = None
         self._last_snap      = 0.0
+        self._last_snap_sign = 0
         self._prev_yaw       = None
         self._prev_time      = None
         self._connected      = False
@@ -286,12 +289,16 @@ class HipSnapTurner:
             if dt > 0:
                 delta = (yaw - self._prev_yaw + 180.0) % 360.0 - 180.0
                 rate  = delta / dt  # °/s
-                if (abs(rate) > snapThreshold
-                        and (now - self._last_snap) > self._COOLDOWN):
-                    self._do_snap(1 if rate > 0 else -1)
-
-        # Throttled status print
-        if DEBUG and now - self._last_status >= self._STATUS_EVERY:
+                if abs(rate) > snapThreshold:
+                    sign    = 1 if rate > 0 else -1
+                    elapsed = now - self._last_snap
+                    return_blocked = (
+                        elapsed < snapReturnDelay / 1000.0
+                        and self._last_snap_sign != 0
+                        and sign != self._last_snap_sign
+                    )
+                    if not return_blocked and elapsed > self._COOLDOWN:
+                        self._do_snap(sign)
             self._last_status = now
             print(f"[Hip] yaw: {yaw:+.1f}°  rate: {rate:.0f} °/s")
 
@@ -299,7 +306,8 @@ class HipSnapTurner:
         self._prev_time = now
 
     def _do_snap(self, sign):
-        self._last_snap = time.monotonic()
+        self._last_snap      = time.monotonic()
+        self._last_snap_sign = sign
         direction = 'right' if sign > 0 else 'left'
         print(f"[Hip] snap {direction}")
 
@@ -334,6 +342,26 @@ _kb = _KbController()
 
 hip_turner = HipSnapTurner()
 _current_left_y = 0  # shared: lets snap pulse read current walk Y
+
+
+def _make_label_row(text, font, tip):
+    """Return (QHBoxLayout, QLabel) with the label and a hoverable ? help icon."""
+    lbl = QLabel(text)
+    lbl.setFont(font)
+    hint = QLabel("?")
+    hint.setObjectName("helpIcon")
+    _hf = QFont("Segoe UI", 10)
+    _hf.setWeight(QFont.Weight.Bold)
+    hint.setFont(_hf)
+    hint.setToolTip(tip)
+    hint.setCursor(QtCore.Qt.CursorShape.WhatsThisCursor)
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(6)
+    row.addWidget(lbl)
+    row.addWidget(hint)
+    row.addStretch()
+    return row, lbl
 
 
 class ToggleSwitch(QCheckBox):
@@ -527,6 +555,18 @@ class MainWindow(QWidget):
                 background-color: #1c1c36;
                 border-color: #1e1e3a;
             }
+            QLabel#helpIcon {
+                color: #5a5a8a;
+                background-color: #252545;
+                border: 1px solid #4a4a7a;
+                border-radius: 9px;
+                padding: 0px 5px;
+            }
+            QLabel#helpIcon:hover {
+                color: #c8d0f0;
+                background-color: #3a3a66;
+                border-color: #7070c0;
+            }
         """)
 
         # --- Widgets ---
@@ -558,9 +598,11 @@ class MainWindow(QWidget):
         self.invertCheck.setFont(labelFont)
         self.invertCheck.setChecked(invertY)
         self.invertCheck.stateChanged.connect(self.onInvertYChanged)
+        self.invertCheck.setToolTip("Reverses the treadmill walking direction on the joystick Y axis.")
 
-        senseLabel = QLabel("SENSITIVITY")
-        senseLabel.setFont(labelFont)
+        senseLabelRow, senseLabel = _make_label_row("SENSITIVITY", labelFont,
+            "How strongly mouse Y movement translates to the left joystick.\n"
+            "Higher = faster virtual movement per physical step on the treadmill.")
 
         self.senseLine = QLineEdit(str(sensitivity))
         self.senseLine.setFont(inputFont)
@@ -586,8 +628,9 @@ class MainWindow(QWidget):
         senseRow.addWidget(self.senseLine)
         senseRow.addWidget(senseIncBtn)
 
-        pollLabel = QLabel("POLLING RATE  (/sec)")
-        pollLabel.setFont(labelFont)
+        pollLabelRow, pollLabel = _make_label_row("POLLING RATE  (/sec)", labelFont,
+            "How many times per second mouse input is sampled and sent to the gamepad.\n"
+            "Higher = smoother response, lower = less CPU usage.")
 
         self.pollRateLine = QLineEdit(str(pollRate))
         self.pollRateLine.setFont(inputFont)
@@ -619,10 +662,10 @@ class MainWindow(QWidget):
         mouseSubLayout.setSpacing(10)
         mouseSubLayout.addWidget(self.invertCheck)
         mouseSubLayout.addSpacing(4)
-        mouseSubLayout.addWidget(senseLabel)
+        mouseSubLayout.addLayout(senseLabelRow)
         mouseSubLayout.addLayout(senseRow)
         mouseSubLayout.addSpacing(4)
-        mouseSubLayout.addWidget(pollLabel)
+        mouseSubLayout.addLayout(pollLabelRow)
         mouseSubLayout.addLayout(pollRow)
         self.mouseSubGroup.setEnabled(mouseEnabled)
 
@@ -642,9 +685,11 @@ class MainWindow(QWidget):
         self.hipCheck.setFont(toggleFont)
         self.hipCheck.setChecked(hipEnabled)
         self.hipCheck.stateChanged.connect(self.onHipCheckChanged)
+        self.hipCheck.setToolTip("Enables snap turns triggered by fast hip yaw twists detected via SlimeVR VMC output.")
 
-        snapLabel = QLabel("SNAP THRESHOLD  (°/s)")
-        snapLabel.setFont(labelFont)
+        snapLabelRow, snapLabel = _make_label_row("SNAP THRESHOLD  (°/s)", labelFont,
+            "Minimum hip rotation speed (degrees/second) needed to trigger a snap turn.\n"
+            "Lower = more sensitive to small twists.")
 
         self.snapLine = QLineEdit(str(snapThreshold))
         self.snapLine.setFont(inputFont)
@@ -670,35 +715,38 @@ class MainWindow(QWidget):
         snapRow.addWidget(self.snapLine)
         snapRow.addWidget(snapIncBtn)
 
-        snapDurLabel = QLabel("SNAP DURATION  (ms)")
-        snapDurLabel.setFont(labelFont)
+        retDelayLabelRow, retDelayLabel = _make_label_row("RETURN DELAY  (ms)", labelFont,
+            "After a snap, opposite-direction snaps are blocked for this duration.\n"
+            "Lets you return your hip to rest position at any speed without triggering\n"
+            "an unwanted reverse snap. Same-direction snaps remain active throughout.")
 
-        self.snapDurLine = QLineEdit(str(snapDuration))
-        self.snapDurLine.setFont(inputFont)
-        self.snapDurLine.setMinimumHeight(56)
-        self.snapDurLine.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.snapDurLine.textChanged.connect(self.setSnapDuration)
+        self.retDelayLine = QLineEdit(str(snapReturnDelay))
+        self.retDelayLine.setFont(inputFont)
+        self.retDelayLine.setMinimumHeight(56)
+        self.retDelayLine.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.retDelayLine.textChanged.connect(self.setReturnDelay)
 
-        snapDurDecBtn = QPushButton("−")
-        snapDurDecBtn.setFont(btnFont)
-        snapDurDecBtn.setMinimumHeight(56)
-        snapDurDecBtn.setMinimumWidth(60)
-        snapDurDecBtn.clicked.connect(self.decreaseSnapDuration)
+        retDelayDecBtn = QPushButton("−")
+        retDelayDecBtn.setFont(btnFont)
+        retDelayDecBtn.setMinimumHeight(56)
+        retDelayDecBtn.setMinimumWidth(60)
+        retDelayDecBtn.clicked.connect(self.decreaseReturnDelay)
 
-        snapDurIncBtn = QPushButton("+")
-        snapDurIncBtn.setFont(btnFont)
-        snapDurIncBtn.setMinimumHeight(56)
-        snapDurIncBtn.setMinimumWidth(60)
-        snapDurIncBtn.clicked.connect(self.increaseSnapDuration)
+        retDelayIncBtn = QPushButton("+")
+        retDelayIncBtn.setFont(btnFont)
+        retDelayIncBtn.setMinimumHeight(56)
+        retDelayIncBtn.setMinimumWidth(60)
+        retDelayIncBtn.clicked.connect(self.increaseReturnDelay)
 
-        snapDurRow = QHBoxLayout()
-        snapDurRow.setSpacing(8)
-        snapDurRow.addWidget(snapDurDecBtn)
-        snapDurRow.addWidget(self.snapDurLine)
-        snapDurRow.addWidget(snapDurIncBtn)
+        retDelayRow = QHBoxLayout()
+        retDelayRow.setSpacing(8)
+        retDelayRow.addWidget(retDelayDecBtn)
+        retDelayRow.addWidget(self.retDelayLine)
+        retDelayRow.addWidget(retDelayIncBtn)
 
-        vmcPortLabel = QLabel("VMC PORT OUT")
-        vmcPortLabel.setFont(labelFont)
+        vmcPortLabelRow, vmcPortLabel2 = _make_label_row("VMC PORT OUT", labelFont,
+            "UDP port on which SlimeVR broadcasts VMC/OSC tracking data.\n"
+            "Must match the VMC Output port configured in SlimeVR settings.")
 
         self.vmcPortLine = QLineEdit(str(vmcPort))
         self.vmcPortLine.setFont(inputFont)
@@ -706,24 +754,18 @@ class MainWindow(QWidget):
         self.vmcPortLine.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.vmcPortLine.textChanged.connect(self.setVmcPort)
 
-        self.snapKbCheck = ToggleSwitch("Snap via keyboard  Q/E", "  (active)", "  (gamepad)")
-        self.snapKbCheck.setFont(labelFont)
-        self.snapKbCheck.setChecked(snapUseKeyboard)
-        self.snapKbCheck.stateChanged.connect(self.onSnapKbChanged)
-
         self.hipSubGroup = QFrame()
         hipSubLayout = QVBoxLayout(self.hipSubGroup)
         hipSubLayout.setContentsMargins(0, 4, 0, 0)
         hipSubLayout.setSpacing(10)
-        hipSubLayout.addWidget(self.snapKbCheck)
         hipSubLayout.addSpacing(4)
-        hipSubLayout.addWidget(snapLabel)
+        hipSubLayout.addLayout(snapLabelRow)
         hipSubLayout.addLayout(snapRow)
         hipSubLayout.addSpacing(4)
-        hipSubLayout.addWidget(snapDurLabel)
-        hipSubLayout.addLayout(snapDurRow)
+        hipSubLayout.addLayout(retDelayLabelRow)
+        hipSubLayout.addLayout(retDelayRow)
         hipSubLayout.addSpacing(4)
-        hipSubLayout.addWidget(vmcPortLabel)
+        hipSubLayout.addLayout(vmcPortLabelRow)
         hipSubLayout.addWidget(self.vmcPortLine)
         self.hipSubGroup.setEnabled(hipEnabled)
 
@@ -842,26 +884,26 @@ class MainWindow(QWidget):
         _save_config()
         print("Snap threshold:", snapThreshold)
 
-    def setSnapDuration(a, b):
-        global snapDuration
-        if b != "":
-            snapDuration = int(b)
+    def setReturnDelay(a, b):
+        global snapReturnDelay
+        if b != "" and b.isdigit():
+            snapReturnDelay = int(b)
             _save_config()
-            print("Snap duration:", b)
+            print("Return delay:", b)
 
-    def decreaseSnapDuration(self):
-        global snapDuration
-        snapDuration = max(50, snapDuration - 50)
-        self.snapDurLine.setText(str(snapDuration))
+    def decreaseReturnDelay(self):
+        global snapReturnDelay
+        snapReturnDelay = max(0, snapReturnDelay - 100)
+        self.retDelayLine.setText(str(snapReturnDelay))
         _save_config()
-        print("Snap duration:", snapDuration)
+        print("Return delay:", snapReturnDelay)
 
-    def increaseSnapDuration(self):
-        global snapDuration
-        snapDuration += 50
-        self.snapDurLine.setText(str(snapDuration))
+    def increaseReturnDelay(self):
+        global snapReturnDelay
+        snapReturnDelay += 100
+        self.retDelayLine.setText(str(snapReturnDelay))
         _save_config()
-        print("Snap duration:", snapDuration)
+        print("Return delay:", snapReturnDelay)
 
     def setVmcPort(a, b):
         global vmcPort
@@ -921,9 +963,11 @@ class MainWindow(QWidget):
         self._updateStartAllBtn()
 
     def _pollLoop(self):
-        mousey  = 0
-        mousey1 = 0
-        mousey2 = 0
+        mousey        = 0
+        mousey1       = 0
+        mousey2       = 0
+        _last_log_t   = 0.0
+        _LOG_INTERVAL = 0.3  # seconds between joystick log lines
         _raw_reader.consume_delta()  # flush any pre-accumulated movement
         while not stop_event.is_set():
             mousey2 = mousey1
@@ -933,8 +977,10 @@ class MainWindow(QWidget):
             mousey1 = raw_delta * direction
 
             mousey = max(-32768, min(32767, int((mousey1 + mousey2) / 2)))  # average and clamp
-            if mousey != 0:
+            now = time.monotonic()
+            if mousey != 0 and (DEBUG or now - _last_log_t >= _LOG_INTERVAL):
                 print("Joystick y:", mousey)
+                _last_log_t = now
 
             with gamepad_lock:
                 gamepad.left_joystick(x_value=0, y_value=mousey)

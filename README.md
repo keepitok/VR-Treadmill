@@ -95,3 +95,10 @@ The following SteamVR **Gamepad** binding configuration was verified to work for
 
 Settings are saved automatically.
 
+---
+
+## Troubleshooting
+
+**SteamVR stops seeing the virtual gamepad mid-session (e.g. after switching from game to virtual desktop and back)**  
+Close SteamVR and Steam desktop apps, then relaunch the game. 
+
