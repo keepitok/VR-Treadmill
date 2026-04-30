@@ -5,7 +5,7 @@ import threading
 import json
 import os
 import sys
-from pynput.keyboard import Key, Listener
+from pynput.keyboard import Key, Listener, Controller as _KbController
 from pynput.mouse import Controller
 from pythonosc import dispatcher, osc_server
 from PyQt6 import QtCore
@@ -20,8 +20,8 @@ DEBUG = "--debug" in sys.argv
 # -------------------------------------------------------------------
 _CONFIG_PATH = os.path.join(os.environ["APPDATA"], "Maratron TreadMouse", "config.json")
 _DEFAULTS = {"sensitivity": 35, "pollRate": 30, "invertY": False,
-             "snapThreshold": 120, "snapDuration": 150, "vmcPort": 39539,
-             "mouseEnabled": True, "hipEnabled": False}
+             "snapThreshold": 120, "snapDuration": 600, "vmcPort": 39539,
+             "mouseEnabled": True, "hipEnabled": False, "snapUseKeyboard": False}
 
 def _load_config():
     try:
@@ -35,7 +35,8 @@ def _save_config():
     with open(_CONFIG_PATH, "w") as f:
         json.dump({"sensitivity": sensitivity, "pollRate": pollRate, "invertY": invertY,
                    "snapThreshold": snapThreshold, "snapDuration": snapDuration, "vmcPort": vmcPort,
-                   "mouseEnabled": mouseEnabled, "hipEnabled": hipEnabled}, f, indent=2)
+                   "mouseEnabled": mouseEnabled, "hipEnabled": hipEnabled,
+                   "snapUseKeyboard": snapUseKeyboard}, f, indent=2)
 
 gamepad = vg.VX360Gamepad()
 gamepad_lock = threading.Lock()
@@ -52,8 +53,11 @@ invertY       = _cfg["invertY"]
 snapThreshold = _cfg["snapThreshold"]
 snapDuration  = _cfg["snapDuration"]
 vmcPort       = _cfg["vmcPort"]
-mouseEnabled  = _cfg["mouseEnabled"]
-hipEnabled    = _cfg["hipEnabled"]
+mouseEnabled     = _cfg["mouseEnabled"]
+hipEnabled       = _cfg["hipEnabled"]
+snapUseKeyboard  = _cfg["snapUseKeyboard"]
+snapKeyLeft      = 'q'
+snapKeyRight     = 'e'
 # -------------------------------------------------------------------
 
 # -------------------------------------------------------------------
@@ -296,22 +300,40 @@ class HipSnapTurner:
 
     def _do_snap(self, sign):
         self._last_snap = time.monotonic()
-        axis = 32767 if sign > 0 else -32768
-        duration = snapDuration / 1000.0
-        print(f"[Hip] snap {'right' if axis > 0 else 'left'}")
+        direction = 'right' if sign > 0 else 'left'
+        print(f"[Hip] snap {direction}")
 
-        def _pulse():
-            with gamepad_lock:
-                gamepad.right_joystick(x_value=axis, y_value=0)
-                gamepad.update()
-            time.sleep(duration)
-            with gamepad_lock:
-                gamepad.right_joystick(x_value=0, y_value=0)
-                gamepad.update()
+        if snapUseKeyboard:
+            key = snapKeyRight if sign > 0 else snapKeyLeft
+            def _kb_pulse():
+                _kb.press(key)
+                time.sleep(snapDuration / 1000.0)
+                _kb.release(key)
+            threading.Thread(target=_kb_pulse, daemon=True).start()
+        else:
+            axis = 32767 if sign > 0 else -32768
+            hold = snapDuration / 1000.0
+            def _pulse():
+                _STEPS = 12
+                _RAMP  = 0.06
+                step_t = _RAMP / _STEPS
+                for i in range(1, _STEPS + 1):
+                    with gamepad_lock:
+                        gamepad.right_joystick(x_value=int(axis * i / _STEPS), y_value=0)
+                        gamepad.update()
+                    time.sleep(step_t)
+                time.sleep(hold)
+                for i in range(_STEPS - 1, -1, -1):
+                    with gamepad_lock:
+                        gamepad.right_joystick(x_value=int(axis * i / _STEPS), y_value=0)
+                        gamepad.update()
+                    time.sleep(step_t)
+            threading.Thread(target=_pulse, daemon=True).start()
 
-        threading.Thread(target=_pulse, daemon=True).start()
+_kb = _KbController()
 
 hip_turner = HipSnapTurner()
+_current_left_y = 0  # shared: lets snap pulse read current walk Y
 
 
 class ToggleSwitch(QCheckBox):
@@ -648,6 +670,33 @@ class MainWindow(QWidget):
         snapRow.addWidget(self.snapLine)
         snapRow.addWidget(snapIncBtn)
 
+        snapDurLabel = QLabel("SNAP DURATION  (ms)")
+        snapDurLabel.setFont(labelFont)
+
+        self.snapDurLine = QLineEdit(str(snapDuration))
+        self.snapDurLine.setFont(inputFont)
+        self.snapDurLine.setMinimumHeight(56)
+        self.snapDurLine.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.snapDurLine.textChanged.connect(self.setSnapDuration)
+
+        snapDurDecBtn = QPushButton("−")
+        snapDurDecBtn.setFont(btnFont)
+        snapDurDecBtn.setMinimumHeight(56)
+        snapDurDecBtn.setMinimumWidth(60)
+        snapDurDecBtn.clicked.connect(self.decreaseSnapDuration)
+
+        snapDurIncBtn = QPushButton("+")
+        snapDurIncBtn.setFont(btnFont)
+        snapDurIncBtn.setMinimumHeight(56)
+        snapDurIncBtn.setMinimumWidth(60)
+        snapDurIncBtn.clicked.connect(self.increaseSnapDuration)
+
+        snapDurRow = QHBoxLayout()
+        snapDurRow.setSpacing(8)
+        snapDurRow.addWidget(snapDurDecBtn)
+        snapDurRow.addWidget(self.snapDurLine)
+        snapDurRow.addWidget(snapDurIncBtn)
+
         vmcPortLabel = QLabel("VMC PORT OUT")
         vmcPortLabel.setFont(labelFont)
 
@@ -657,12 +706,22 @@ class MainWindow(QWidget):
         self.vmcPortLine.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.vmcPortLine.textChanged.connect(self.setVmcPort)
 
+        self.snapKbCheck = ToggleSwitch("Snap via keyboard  Q/E", "  (active)", "  (gamepad)")
+        self.snapKbCheck.setFont(labelFont)
+        self.snapKbCheck.setChecked(snapUseKeyboard)
+        self.snapKbCheck.stateChanged.connect(self.onSnapKbChanged)
+
         self.hipSubGroup = QFrame()
         hipSubLayout = QVBoxLayout(self.hipSubGroup)
         hipSubLayout.setContentsMargins(0, 4, 0, 0)
         hipSubLayout.setSpacing(10)
+        hipSubLayout.addWidget(self.snapKbCheck)
+        hipSubLayout.addSpacing(4)
         hipSubLayout.addWidget(snapLabel)
         hipSubLayout.addLayout(snapRow)
+        hipSubLayout.addSpacing(4)
+        hipSubLayout.addWidget(snapDurLabel)
+        hipSubLayout.addLayout(snapDurRow)
         hipSubLayout.addSpacing(4)
         hipSubLayout.addWidget(vmcPortLabel)
         hipSubLayout.addWidget(self.vmcPortLine)
@@ -756,6 +815,12 @@ class MainWindow(QWidget):
         self.hipSubGroup.setEnabled(hipEnabled)
         _save_config()
 
+    def onSnapKbChanged(self, state):
+        global snapUseKeyboard
+        snapUseKeyboard = bool(state)
+        _save_config()
+        print("Snap via keyboard:", snapUseKeyboard)
+
     def setSnapThreshold(a, b):
         global snapThreshold
         if b != "":
@@ -776,6 +841,27 @@ class MainWindow(QWidget):
         self.snapLine.setText(str(snapThreshold))
         _save_config()
         print("Snap threshold:", snapThreshold)
+
+    def setSnapDuration(a, b):
+        global snapDuration
+        if b != "":
+            snapDuration = int(b)
+            _save_config()
+            print("Snap duration:", b)
+
+    def decreaseSnapDuration(self):
+        global snapDuration
+        snapDuration = max(50, snapDuration - 50)
+        self.snapDurLine.setText(str(snapDuration))
+        _save_config()
+        print("Snap duration:", snapDuration)
+
+    def increaseSnapDuration(self):
+        global snapDuration
+        snapDuration += 50
+        self.snapDurLine.setText(str(snapDuration))
+        _save_config()
+        print("Snap duration:", snapDuration)
 
     def setVmcPort(a, b):
         global vmcPort
@@ -852,6 +938,7 @@ class MainWindow(QWidget):
 
             with gamepad_lock:
                 gamepad.left_joystick(x_value=0, y_value=mousey)
+                _current_left_y = mousey
                 gamepad.update()
             time.sleep(1 / pollRate)
 

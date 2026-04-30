@@ -66,6 +66,21 @@ A fast clockwise hip twist fires a **snap turn right**; anti-clockwise fires **s
 
 ---
 
+## Tested Game Bindings
+
+### Half-Life 2: VR Mod
+
+The following SteamVR **Gamepad** binding configuration was verified to work for both mouse locomotion and hip snap turns:
+
+| Thumbstick | Use as | Variable | Value |
+|---|---|---|---|
+| Left | Joystick | Position | Move |
+| Right | D-Pad | Mode | Touch |
+| Right | D-Pad | East | Turn Right |
+| Right | D-Pad | West | Turn Left |
+
+---
+
 ## UI Controls
 
 | Control | Description |
