@@ -1,4 +1,4 @@
-# Maratron TreadMouse
+# Maratron Locomotion
 
 Allows you to use mouse movement for forward/backward locomotion in VR — no gamepad required.
 
@@ -36,7 +36,7 @@ Launch Virtual Desktop on your PC and in your headset. Connect as normal.
 ```
 python treadmill.py
 ```  
-This registers a virtual Xbox 360 gamepad over USB. The Maratron TreadMouse window will open — don't click Start yet.
+This registers a virtual Xbox 360 gamepad over USB. The Maratron Locomotion window will open — don't click Start yet.
 
 **3. Start SteamVR**  
 Once SteamVR loads, the virtual gamepad should appear as a connected/active controller in the SteamVR device icons.
@@ -45,7 +45,7 @@ Once SteamVR loads, the virtual gamepad should appear as a connected/active cont
 Go to **Settings → Controllers → Manage Controller Bindings**, select **Gamepad**, and edit the binding for your game. Map the **left joystick** to locomotion/movement and the **right joystick** to snap turn.
 
 **5. Begin treadmill tracking**  
-Click **▶ Start** in the Maratron TreadMouse window. 
+Click **▶ Start** in the Maratron Locomotion window. 
 
 **6. Start your game**
 
@@ -59,7 +59,7 @@ Additional setup steps (do these once):
 
 1. In SlimeVR Server, assign the phone tracker to the **Hip** slot.
 2. Go to **SlimeVR Settings → OSC/VMC**, enable **VMC output**, and set **Port Out** to **39539**.
-3. In the Maratron TreadMouse window, click **Hip Tracking: OFF** to toggle it on. The script will start listening for VMC data on UDP port 39540.
+3. In the Maratron Locomotion window, click **Hip Tracking: OFF** to toggle it on. The script will start listening for VMC data on UDP port 39540.
 
 A fast clockwise hip twist fires a **snap turn right**; anti-clockwise fires **snap turn left**. Adjust **Snap Threshold** to taste — lower values are more sensitive.
 
